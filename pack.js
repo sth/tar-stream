@@ -91,23 +91,68 @@ Void.prototype.destroy = function () {
   this.emit('close')
 }
 
+var PackJob = function (packer, paused) {
+  this._packer = packer
+  this._paused = paused
+  this._drain = noop
+  this._stream = null
+  this._buffers = []
+}
+
+PackJob.prototype.push = function (buffer) {
+  if (this._paused) {
+    this._buffers.push(buffer)
+    return false
+  }
+
+  return this._packer.push(buffer)
+}
+
+PackJob.prototype.unpause = function () {
+  if (!this._paused) return
+
+  this.write_buffers()
+  this._paused = false
+
+  if (this._stream) {
+    var drain = this._drain
+    this._drain = noop
+    drain()
+    return
+  }
+
+  this._packer._next_job()
+}
+
+PackJob.prototype.write_buffers = function () {
+  for (var i = 0; i < this._buffers.length; ++i) {
+    this._packer.push(this._buffers[i])
+  }
+  this._buffers = null
+}
+
 var Pack = function (opts) {
   if (!(this instanceof Pack)) return new Pack(opts)
   Readable.call(this, opts)
 
-  this._drain = noop
   this._finalized = false
   this._finalizing = false
   this._destroyed = false
-  this._stream = null
+  this._jobs = []
 }
 
 util.inherits(Pack, Readable)
 
 Pack.prototype.entry = function (header, buffer, callback) {
-  if (this._stream) throw new Error('already piping an entry')
   if (this._finalized || this._destroyed) return
 
+  var paused = !!this._jobs.length
+  var job = new PackJob(this, paused)
+  this._jobs.push(job)
+  return job.entry(header, buffer, callback)
+}
+
+PackJob.prototype.entry = function (header, buffer, callback) {
   if (typeof buffer === 'function') {
     callback = buffer
     buffer = null
@@ -130,20 +175,24 @@ Pack.prototype.entry = function (header, buffer, callback) {
     this._encode(header)
     this.push(buffer)
     overflow(self, header.size)
+    if (!this._paused) self._packer._next_job()
     process.nextTick(callback)
     return new Void()
   }
 
   if (header.type === 'symlink' && !header.linkname) {
     var linkSink = new LinkSink()
+    this._stream = linkSink
     eos(linkSink, function (err) {
+      self._stream = null
       if (err) { // stream was closed
-        self.destroy()
+        self._packer.destroy()
         return callback(err)
       }
 
       header.linkname = linkSink.linkname
       self._encode(header)
+      if (!self._paused) self._packer._next_job()
       callback()
     })
 
@@ -153,6 +202,7 @@ Pack.prototype.entry = function (header, buffer, callback) {
   this._encode(header)
 
   if (header.type !== 'file' && header.type !== 'contiguous-file') {
+    if (!this._paused) self._packer._next_job()
     process.nextTick(callback)
     return new Void()
   }
@@ -165,17 +215,17 @@ Pack.prototype.entry = function (header, buffer, callback) {
     self._stream = null
 
     if (err) { // stream was closed
-      self.destroy()
+      self._packer.destroy()
       return callback(err)
     }
 
     if (sink.written !== header.size) { // corrupting tar
-      self.destroy()
+      self._packer.destroy()
       return callback(new Error('size mismatch'))
     }
 
     overflow(self, header.size)
-    if (self._finalizing) self.finalize()
+    if (!self._paused) self._packer._next_job()
     callback()
   })
 
@@ -183,7 +233,7 @@ Pack.prototype.entry = function (header, buffer, callback) {
 }
 
 Pack.prototype.finalize = function () {
-  if (this._stream) {
+  if (this._jobs.length) {
     this._finalizing = true
     return
   }
@@ -200,10 +250,13 @@ Pack.prototype.destroy = function (err) {
 
   if (err) this.emit('error', err)
   this.emit('close')
-  if (this._stream && this._stream.destroy) this._stream.destroy()
+  for (var i = 0; i < this._jobs.length; ++i) {
+    var job = this._jobs[i]
+    if (job._stream && job._stream.destroy) job._stream.destroy()
+  }
 }
 
-Pack.prototype._encode = function (header) {
+PackJob.prototype._encode = function (header) {
   if (!header.pax) {
     var buf = headers.encode(header)
     if (buf) {
@@ -214,7 +267,7 @@ Pack.prototype._encode = function (header) {
   this._encodePax(header)
 }
 
-Pack.prototype._encodePax = function (header) {
+PackJob.prototype._encodePax = function (header) {
   var paxHeader = headers.encodePax({
     name: header.name,
     linkname: header.linkname,
@@ -246,9 +299,17 @@ Pack.prototype._encodePax = function (header) {
 }
 
 Pack.prototype._read = function (n) {
-  var drain = this._drain
-  this._drain = noop
-  drain()
+  if (this._jobs[0]) {
+    var drain = this._jobs[0]._drain
+    this._jobs[0]._drain = noop
+    drain()
+  }
+}
+
+Pack.prototype._next_job = function () {
+  this._jobs.shift()
+  if (this._jobs.length) return this._jobs[0].unpause()
+  if (this._finalizing) this.finalize()
 }
 
 module.exports = Pack
