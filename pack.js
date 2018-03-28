@@ -137,6 +137,7 @@ var Pack = function (opts) {
 
   this._finalized = false
   this._finalizing = false
+  this._finalizing_cb = noop
   this._destroyed = false
   this._jobs = []
 }
@@ -232,16 +233,22 @@ PackJob.prototype.entry = function (header, buffer, callback) {
   return sink
 }
 
-Pack.prototype.finalize = function () {
+Pack.prototype.finalize = function (callback) {
+  if (!callback) callback = noop
+
+  if (this._destroyed) return callback(new Error('stream is destroyed'))
+  if (this._finalized) return callback(new Error('already finalized'))
+
   if (this._jobs.length) {
     this._finalizing = true
+    this._finalizing_cb = callback
     return
   }
 
-  if (this._finalized) return
   this._finalized = true
   this.push(END_OF_TAR)
   this.push(null)
+  callback()
 }
 
 Pack.prototype.destroy = function (err) {
@@ -309,7 +316,11 @@ Pack.prototype._read = function (n) {
 Pack.prototype._next_job = function () {
   this._jobs.shift()
   if (this._jobs.length) return this._jobs[0].unpause()
-  if (this._finalizing) this.finalize()
+  if (this._finalizing) {
+    var cb = this._finalizing_cb
+    this._finalizing_cb = noop
+    this.finalize(cb)
+  }
 }
 
 module.exports = Pack
